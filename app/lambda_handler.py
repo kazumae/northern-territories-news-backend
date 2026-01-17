@@ -34,6 +34,7 @@ S3_KEY = os.environ.get("S3_KEY", "data/articles.json")
 # Search keywords for Google News
 SEARCH_KEYWORDS = [
     "北方領土",
+    "北方四島",
     "択捉島",
     "国後島",
     "色丹島",
