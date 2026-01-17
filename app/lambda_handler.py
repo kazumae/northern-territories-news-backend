@@ -1,19 +1,21 @@
 """
-AWS Lambda handler for Northern Territories News RSS aggregation.
+AWS Lambda handler for Northern Territories News aggregation via Google News RSS.
 
-This handler is triggered by EventBridge schedule to fetch RSS feeds,
-filter articles related to Northern Territories, and upload the result to S3.
+This handler is triggered by EventBridge schedule to fetch Google News RSS feeds,
+collect articles related to Northern Territories, and upload the result to S3.
 """
 
 import asyncio
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
-from urllib.parse import urlparse, urlunparse
+from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse, urlunparse, quote
 
-from app.config import settings
-from app.fetcher import RSSFetcher
+import feedparser
+import httpx
 
 # Configure logging
 logger = logging.getLogger()
@@ -26,8 +28,20 @@ if os.environ.get("AWS_LAMBDA_FUNCTION_NAME"):
     s3_client = boto3.client("s3")
 
 # Environment variables
-S3_BUCKET = os.environ.get("S3_BUCKET", "northern-territories-news")
+S3_BUCKET = os.environ.get("S3_BUCKET", "northern-territories-news-prod")
 S3_KEY = os.environ.get("S3_KEY", "data/articles.json")
+
+# Search keywords for Google News
+SEARCH_KEYWORDS = [
+    "北方領土",
+    "択捉島",
+    "国後島",
+    "色丹島",
+    "歯舞群島",
+]
+
+# Maximum articles to keep
+MAX_ARTICLES = 500
 
 
 def normalize_url(url: str) -> str:
@@ -38,65 +52,138 @@ def normalize_url(url: str) -> str:
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, '', '', ''))
 
 
-async def fetch_and_process():
+def extract_source_from_title(title: str) -> tuple[str, str]:
     """
-    Fetch RSS feeds and process articles.
+    Extract source name from Google News title format.
+
+    Google News titles are formatted as: "Article Title - Source Name"
 
     Returns:
-        dict: Result containing articles and metadata
+        tuple: (clean_title, source_name)
     """
-    fetcher = RSSFetcher()
+    if " - " in title:
+        parts = title.rsplit(" - ", 1)
+        if len(parts) == 2:
+            return parts[0].strip(), parts[1].strip()
+    return title, "Google News"
 
-    # Fetch all feeds
-    import httpx
-    from app.config import RSS_FEEDS
 
+def parse_pub_date(pub_date_str: str) -> datetime:
+    """Parse publication date from RSS feed."""
+    try:
+        # Try RFC 2822 format (standard RSS)
+        return parsedate_to_datetime(pub_date_str)
+    except Exception:
+        pass
+
+    try:
+        # Try ISO format
+        return datetime.fromisoformat(pub_date_str.replace('Z', '+00:00'))
+    except Exception:
+        pass
+
+    # Default to now
+    return datetime.now(timezone.utc)
+
+
+async def fetch_google_news_rss(keyword: str, client: httpx.AsyncClient) -> list[dict]:
+    """
+    Fetch articles from Google News RSS for a specific keyword.
+
+    Args:
+        keyword: Search keyword
+        client: HTTP client
+
+    Returns:
+        List of article dictionaries
+    """
+    encoded_keyword = quote(keyword)
+    url = f"https://news.google.com/rss/search?q={encoded_keyword}&hl=ja&gl=JP&ceid=JP:ja"
+
+    try:
+        response = await client.get(url, timeout=30.0)
+        response.raise_for_status()
+
+        feed = feedparser.parse(response.text)
+
+        if feed.bozo and not feed.entries:
+            logger.warning(f"Failed to parse feed for '{keyword}': {feed.bozo_exception}")
+            return []
+
+        articles = []
+        for entry in feed.entries:
+            try:
+                raw_title = entry.get("title", "").strip()
+                if not raw_title:
+                    continue
+
+                # Extract clean title and source
+                title, source = extract_source_from_title(raw_title)
+
+                # Get link (Google News redirect URL)
+                link = entry.get("link", "").strip()
+                if not link:
+                    continue
+
+                # Parse publication date
+                pub_date_str = entry.get("published", "")
+                published_at = parse_pub_date(pub_date_str)
+
+                articles.append({
+                    "title": title,
+                    "url": link,
+                    "source": source,
+                    "publishedAt": published_at.isoformat(),
+                })
+
+            except Exception as e:
+                logger.debug(f"Failed to parse entry: {e}")
+                continue
+
+        logger.info(f"Fetched {len(articles)} articles for '{keyword}'")
+        return articles
+
+    except Exception as e:
+        logger.error(f"Error fetching RSS for '{keyword}': {e}")
+        return []
+
+
+async def fetch_all_keywords() -> dict:
+    """
+    Fetch articles for all keywords.
+
+    Returns:
+        dict: Result containing articles and stats
+    """
     all_articles = []
-    feed_statuses = []
-
-    async with httpx.AsyncClient(
-        headers={"User-Agent": "NorthernTerritoriesNewsBot/1.0"},
-        follow_redirects=True,
-    ) as client:
-        tasks = [fetcher.fetch_feed(client, feed) for feed in RSS_FEEDS]
-        results = await asyncio.gather(*tasks)
-
-        for articles, status in results:
-            all_articles.extend(articles)
-            feed_statuses.append(status)
-
-    # Filter and process
-    filtered = fetcher.filter_articles(all_articles)
-    filtered = fetcher.deduplicate_articles(filtered)
-    filtered = fetcher.sort_articles(filtered)
-
-    if len(filtered) > settings.max_total_articles:
-        filtered = filtered[: settings.max_total_articles]
-
-    # Build response
-    now = datetime.now(timezone.utc)
-
-    data = {
-        "lastUpdated": now.isoformat(),
-        "articles": [
-            {
-                "title": a.title,
-                "url": str(a.url),
-                "source": a.source,
-                "publishedAt": a.published_at.isoformat(),
-            }
-            for a in filtered
-        ],
+    stats = {
+        "keywords_searched": len(SEARCH_KEYWORDS),
+        "successful_fetches": 0,
+        "failed_fetches": 0,
     }
 
-    return {
-        "data": data,
-        "stats": {
-            "total_fetched": len(all_articles),
-            "filtered_count": len(filtered),
-            "successful_feeds": sum(1 for s in feed_statuses if s.success),
-            "failed_feeds": sum(1 for s in feed_statuses if not s.success),
+    async with httpx.AsyncClient(
+        headers={
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         },
+        follow_redirects=True,
+    ) as client:
+        tasks = [fetch_google_news_rss(kw, client) for kw in SEARCH_KEYWORDS]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for i, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(f"Error for keyword '{SEARCH_KEYWORDS[i]}': {result}")
+                stats["failed_fetches"] += 1
+            else:
+                all_articles.extend(result)
+                stats["successful_fetches"] += 1
+
+    stats["total_fetched"] = len(all_articles)
+
+    return {
+        "articles": all_articles,
+        "stats": stats,
     }
 
 
@@ -138,19 +225,30 @@ def merge_articles(existing: list[dict], new_articles: list[dict]) -> list[dict]
     """
     # Build set of normalized URLs from existing articles
     seen_urls = set()
+    seen_titles = set()
+
     for article in existing:
         normalized = normalize_url(article.get('url', ''))
         seen_urls.add(normalized)
+        # Also track titles to avoid duplicates with different URLs
+        seen_titles.add(article.get('title', '').lower())
 
     # Add new articles that don't exist
     merged = existing.copy()
     new_count = 0
+
     for article in new_articles:
         normalized = normalize_url(article.get('url', ''))
-        if normalized not in seen_urls:
-            seen_urls.add(normalized)
-            merged.append(article)
-            new_count += 1
+        title_lower = article.get('title', '').lower()
+
+        # Skip if URL or title already exists
+        if normalized in seen_urls or title_lower in seen_titles:
+            continue
+
+        seen_urls.add(normalized)
+        seen_titles.add(title_lower)
+        merged.append(article)
+        new_count += 1
 
     logger.info(f"Added {new_count} new articles, total: {len(merged)}")
 
@@ -158,8 +256,8 @@ def merge_articles(existing: list[dict], new_articles: list[dict]) -> list[dict]
     merged.sort(key=lambda x: x.get('publishedAt', ''), reverse=True)
 
     # Limit to max articles
-    if len(merged) > settings.max_total_articles:
-        merged = merged[:settings.max_total_articles]
+    if len(merged) > MAX_ARTICLES:
+        merged = merged[:MAX_ARTICLES]
 
     return merged
 
@@ -214,11 +312,11 @@ def handler(event, context):
         # Load existing articles from S3
         existing_articles = load_existing_articles()
 
-        # Run async fetch
-        result = asyncio.run(fetch_and_process())
+        # Fetch from Google News RSS
+        result = asyncio.run(fetch_all_keywords())
 
         # Merge new articles with existing
-        merged_articles = merge_articles(existing_articles, result["data"]["articles"])
+        merged_articles = merge_articles(existing_articles, result["articles"])
 
         # Build final data
         now = datetime.now(timezone.utc)
@@ -233,7 +331,7 @@ def handler(event, context):
         response = {
             "statusCode": 200,
             "body": {
-                "message": "RSS fetch completed successfully",
+                "message": "Google News RSS fetch completed successfully",
                 "stats": {
                     **result["stats"],
                     "existing_articles": len(existing_articles),
@@ -251,7 +349,7 @@ def handler(event, context):
         return {
             "statusCode": 500,
             "body": {
-                "message": "RSS fetch failed",
+                "message": "Google News RSS fetch failed",
                 "error": str(e),
             },
         }
@@ -259,6 +357,5 @@ def handler(event, context):
 
 # For local testing
 if __name__ == "__main__":
-    # Run without S3 upload for local testing
-    result = asyncio.run(fetch_and_process())
+    result = asyncio.run(fetch_all_keywords())
     print(json.dumps(result, ensure_ascii=False, indent=2))
