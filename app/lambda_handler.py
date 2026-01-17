@@ -86,6 +86,38 @@ def parse_pub_date(pub_date_str: str) -> datetime:
     return datetime.now(timezone.utc)
 
 
+def extract_image_url(entry) -> str | None:
+    """
+    Extract image URL from Google News RSS entry.
+
+    Google News RSS uses media:content for images.
+    """
+    # Try media_content (feedparser normalizes media:content)
+    media_content = entry.get("media_content", [])
+    if media_content and isinstance(media_content, list):
+        for media in media_content:
+            url = media.get("url", "")
+            if url and ("jpg" in url or "jpeg" in url or "png" in url or "webp" in url or "image" in url):
+                return url
+
+    # Try media_thumbnail
+    media_thumbnail = entry.get("media_thumbnail", [])
+    if media_thumbnail and isinstance(media_thumbnail, list):
+        for thumb in media_thumbnail:
+            url = thumb.get("url", "")
+            if url:
+                return url
+
+    # Try enclosure
+    enclosures = entry.get("enclosures", [])
+    if enclosures:
+        for enc in enclosures:
+            if enc.get("type", "").startswith("image/"):
+                return enc.get("href") or enc.get("url")
+
+    return None
+
+
 async def fetch_google_news_rss(keyword: str, client: httpx.AsyncClient) -> list[dict]:
     """
     Fetch articles from Google News RSS for a specific keyword.
@@ -129,12 +161,20 @@ async def fetch_google_news_rss(keyword: str, client: httpx.AsyncClient) -> list
                 pub_date_str = entry.get("published", "")
                 published_at = parse_pub_date(pub_date_str)
 
-                articles.append({
+                # Extract image URL
+                image_url = extract_image_url(entry)
+
+                article = {
                     "title": title,
                     "url": link,
                     "source": source,
                     "publishedAt": published_at.isoformat(),
-                })
+                }
+
+                if image_url:
+                    article["imageUrl"] = image_url
+
+                articles.append(article)
 
             except Exception as e:
                 logger.debug(f"Failed to parse entry: {e}")
