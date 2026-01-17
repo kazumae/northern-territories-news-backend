@@ -1,0 +1,73 @@
+name: Deploy Lambda Function
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'app/**'
+      - 'pyproject.toml'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-northeast-1
+  LAMBDA_FUNCTION_NAME: news-collector
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install dependencies
+        run: |
+          mkdir -p package
+
+          # Install pure Python packages
+          pip install --target package \
+            feedparser \
+            python-dateutil \
+            sgmllib3k
+
+          # Install packages with binaries for Lambda
+          pip install --target package \
+            --platform manylinux2014_x86_64 \
+            --implementation cp \
+            --python-version 3.12 \
+            --only-binary=:all: \
+            httpx \
+            pydantic \
+            pydantic-settings
+
+      - name: Create deployment package
+        run: |
+          cp -r app package/
+          cd package
+          zip -r ../lambda_function.zip .
+
+      - name: Deploy to Lambda
+        run: |
+          aws lambda update-function-code \
+            --function-name ${{ env.LAMBDA_FUNCTION_NAME }} \
+            --zip-file fileb://lambda_function.zip
+
+      - name: Wait for update
+        run: |
+          aws lambda wait function-updated \
+            --function-name ${{ env.LAMBDA_FUNCTION_NAME }}
+          echo "Lambda function updated successfully"
